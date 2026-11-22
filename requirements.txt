@@ -1,0 +1,10 @@
+httpx
+flask
+gunicorn
+google-play-scraper
+protobuf-decoder
+protobuf
+pycryptodome
+aiohttp
+yt-dlp
+imageio-ffmpeg
