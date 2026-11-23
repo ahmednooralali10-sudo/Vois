@@ -6,7 +6,6 @@ import time
 import uuid
 import random
 import struct
-import shutil
 import asyncio
 import logging
 import threading
@@ -374,10 +373,6 @@ async def MahirAccepted(uid, code, K, V, region):
     return await GeneRaTePk((await CrEaTe_ProTo(fields)).hex(), '0515', K, V)
 
 
-def HELLXlog(tag, msg):
-    log.info(f"{tag} = > {msg}")
-
-
 def _pb_varint(n):
     if n < 0:
         n = (1 << 64) + n
@@ -442,18 +437,34 @@ async def parse_results(parsed_results):
     return result_dict
 
 
+_CACHED_APP_VERSION = None
+
+
 async def get_playstore_version():
+    global _CACHED_APP_VERSION
+    if _CACHED_APP_VERSION:
+        return _CACHED_APP_VERSION
     loop = asyncio.get_running_loop()
     try:
-        res = await loop.run_in_executor(
-            None, lambda: play_scraper('com.dts.freefireth', lang='hi', country='id')
+        res = await asyncio.wait_for(
+            loop.run_in_executor(
+                None, lambda: play_scraper('com.dts.freefireth', lang='hi', country='id')
+            ),
+            timeout=4.0
         )
-        return res.get("version", "1.134.21")
+        _CACHED_APP_VERSION = res.get("version", "1.134.21")
+        return _CACHED_APP_VERSION
     except Exception:
-        return "1.134.21"
+        _CACHED_APP_VERSION = "1.134.21"
+        return _CACHED_APP_VERSION
+
+
+_CACHED_VER_CFG = {}
 
 
 async def version_config(client_http, region="ME"):
+    if region in _CACHED_VER_CFG:
+        return _CACHED_VER_CFG[region]
     app_version = await get_playstore_version()
     lang = REGION_LANG.get(region, "ar")
     api_url = (
@@ -464,11 +475,14 @@ async def version_config(client_http, region="ME"):
     try:
         res = await client_http.get(api_url)
         data = res.json()
-        return (
+        cfg = (
             data.get("latest_release_version"),
             data.get("remote_version"),
             data.get("server_url"),
         )
+        if cfg[0] and cfg[2]:
+            _CACHED_VER_CFG[region] = cfg
+        return cfg
     except Exception:
         return None
 
@@ -490,7 +504,7 @@ async def get_access_token(client_http, uid, password):
         "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
         "client_id": "100067",
     }
-    for _ in range(3):
+    for _ in range(2):
         try:
             r = await client_http.post(url, headers=hdrs, data=data)
             if r.status_code == 200:
@@ -498,7 +512,7 @@ async def get_access_token(client_http, uid, password):
                 return rd.get("open_id"), rd.get("access_token"), rd.get("platform", 4)
         except Exception:
             pass
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
     return None
 
 
@@ -653,7 +667,7 @@ async def send_getlogin(client_http, data, base_url, token, release_version):
 
 
 async def do_login(uid, password, region_pref="ME"):
-    async with httpx.AsyncClient(verify=False, timeout=15.0) as client_http:
+    async with httpx.AsyncClient(verify=False, timeout=7.0) as client_http:
         vc = await version_config(client_http, region_pref)
         if not vc:
             log.error("version_config failed")
@@ -731,7 +745,7 @@ class SquadBot:
     async def connect(self):
         r = self.login
         self.chat_r, self.chat_w = await asyncio.wait_for(
-            asyncio.open_connection(r["chat_ip"], int(r["chat_port"])), 10
+            asyncio.open_connection(r["chat_ip"], int(r["chat_port"])), 6
         )
         self.chat_w.write(bytes.fromhex(
             HELLXbuild_auth_startup(self.uid, self.token, self.ts, self.key, self.iv)
@@ -739,10 +753,10 @@ class SquadBot:
         await self.chat_w.drain()
         self._spawn(self._chat_read_loop())
         self._spawn(self._keepalive(self.chat_w))
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
         auth, _ = build_ob55_online_auth(self.uid, self.token, self.ts, self.key, self.iv)
         self.online_r, self.online_w = await asyncio.wait_for(
-            asyncio.open_connection(r["online_ip"], int(r["online_port"])), 10
+            asyncio.open_connection(r["online_ip"], int(r["online_port"])), 6
         )
         self.online_w.write(auth)
         await self.online_w.drain()
@@ -761,7 +775,7 @@ class SquadBot:
         except asyncio.CancelledError:
             pass
 
-    async def join(self, team_code, timeout=12):
+    async def join(self, team_code, timeout=8):
         self._joined.clear()
         self.online_w.write(await JoinSq_original(str(team_code), self.key, self.iv))
         await self.online_w.drain()
@@ -924,12 +938,15 @@ class AsyncLoop:
     def run(self, coro):
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
 
+    def start_background(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
 
 async_loop = AsyncLoop()
 
 
 class AccountPool:
-    def __init__(self, concurrency=15):
+    def __init__(self, concurrency=12):
         self.accounts = []
         self.lock = asyncio.Lock()
         self.current_index = 0
@@ -938,6 +955,8 @@ class AccountPool:
         self.concurrency = concurrency
 
     async def load_and_connect(self):
+        if self.loading or self.loaded:
+            return
         self.loading = True
         if not os.path.exists("accs.txt"):
             log.warning("accs.txt not found")
@@ -955,7 +974,7 @@ class AccountPool:
                 uid, password = line.split(":", 1)
                 uid, password = uid.strip(), password.strip()
                 try:
-                    login = await asyncio.to_thread(self._sync_login, uid, password)
+                    login = await do_login(uid, password, "ME")
                     if not login:
                         return
                     bot = SquadBot(login)
@@ -971,17 +990,6 @@ class AccountPool:
         self.loading = False
         self.loaded = True
 
-    def _sync_login(self, uid, password):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(do_login(uid, password, "ME"))
-            loop.close()
-            return result
-        except Exception as e:
-            log.error(f"Login thread error: {e}")
-            return None
-
     async def get_next_bot(self):
         async with self.lock:
             if not self.accounts:
@@ -990,19 +998,19 @@ class AccountPool:
             self.current_index = (self.current_index + 1) % len(self.accounts)
             return bot
 
-    async def wait_for_account(self, timeout=20):
-        deadline = asyncio.get_event_loop().time() + timeout
-        while asyncio.get_event_loop().time() < deadline:
+    async def wait_for_account(self, timeout=12):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
             bot = await self.get_next_bot()
             if bot:
                 return bot
             if self.loaded and not self.accounts:
                 return None
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
         return await self.get_next_bot()
 
 
-account_pool = AccountPool(concurrency=15)
+account_pool = AccountPool(concurrency=12)
 spam_tasks = {}
 
 
@@ -1029,13 +1037,13 @@ async def run_tmc_spam(team_code, text, interval=1.1):
 
     bot = await account_pool.wait_for_account()
     if not bot:
-        return False, "No connected accounts available"
+        return False, "No connected accounts available yet"
 
     if not getattr(bot, "in_team", False):
-        joined = await bot.join(team_code)
+        joined = await bot.join(team_code, timeout=8)
         if not joined:
             return False, "Failed to join team"
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)
         print(f"SUCCESS JOINED TO {team_code}")
 
     old_task = spam_tasks.get(team_code)
@@ -1049,12 +1057,14 @@ async def run_tmc_spam(team_code, text, interval=1.1):
 
 app = Flask(__name__)
 
+# ÙØ¨Ø¯Ø£ ØªØ­ÙÙÙ Ø§ÙØ­Ø³Ø§Ø¨Ø§Øª ÙÙ Ø§ÙØ®ÙÙÙØ© ÙÙØ±Ø§Ù Ø¯ÙÙ ØªØ£Ø®ÙØ± Ø¥ÙÙØ§Ø¹ Ø§ÙØ³ÙØ±ÙØ±
+async_loop.start_background(account_pool.load_and_connect())
+
 
 def _parse_tmc_request():
     raw_tmc = request.args.get("tmc") or request.args.get("team_code") or ""
     raw_text = request.args.get("text") or ""
 
-    # دعم صيغة /tmc=1234567&text=hello إذا وصلت ضمن المسار
     full_path = request.full_path or ""
     match = re.search(r"/tmc=([^&/?]+)(?:&text=(.*))?$", full_path)
     if match:
@@ -1076,6 +1086,7 @@ def index():
     return jsonify({
         "status": "online",
         "accounts_loaded": len(account_pool.accounts),
+        "loading": account_pool.loading,
         "usage": "/tmc?tmc=TEAM_CODE&text=MESSAGE",
         "stop_usage": "/stop_spam?tmc=TEAM_CODE",
         "DEV": DEV_NAME
@@ -1127,6 +1138,5 @@ def stop_spam():
 
 
 if __name__ == "__main__":
-    async_loop.run(account_pool.load_and_connect())
     port = int(os.environ.get("PORT", 8000))
     app.run(host="0.0.0.0", port=port, threaded=True)
